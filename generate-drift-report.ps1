@@ -18,6 +18,7 @@ if (-not ($Prod -or $Preprod)) {
 
 # Resolve base path from the script location
 $BasePath = if ($PSScriptRoot) { $PSScriptRoot } else { Get-Location }
+$DriftSummaryTemplatePath = Join-Path $BasePath "Drift-Summary-Report-Template.html"
 
 if (-not $TemplatePath) {
     $TemplatePath = Join-Path $BasePath "Terraform-Drift-Template.html"
@@ -128,10 +129,10 @@ function Get-EnvironmentFolders {
         $folders = Get-ChildItem -Path $RootPath -Directory -ErrorAction Stop
 
         if ($Prod) {
-            return $folders | Where-Object { $_.Name -like "*Production*" -or $_.Name -like "*prod*" }
+            return $folders | Where-Object { $_.Name -like "*Production*" -or $_.Name -like "*production*" }
         }
 
-        return $folders | Where-Object { $_.Name -notlike "*Production*" -and $_.Name -notlike "*prod*" }
+        return $folders | Where-Object { $_.Name -notlike "*Production*" -and $_.Name -notlike "*production*" }
     }
     catch {
         throw $_
@@ -145,7 +146,7 @@ function Invoke-TerraformPlan {
     
     try {
         Push-Location $FolderPath
-        $planOutput = terraform plan -detailed-exitcode -no-color 2>&1
+        $planOutput = terraform plan -detailed-exitcode -no-color
         $exitCode = $LASTEXITCODE
         Pop-Location
         
@@ -259,9 +260,9 @@ function New-SummaryTableRow {
     try {
         return @"
 <tr>
-    <td>$([System.Web.HttpUtility]::HtmlEncode($FolderName))</td>
-    <td>$([System.Web.HttpUtility]::HtmlEncode($Summary))</td>
-    <td>$([System.Web.HttpUtility]::HtmlEncode($Impact))</td>
+    <td>$([System.Net.WebUtility]::HtmlEncode($FolderName))</td>
+    <td>$([System.Net.WebUtility]::HtmlEncode($Summary))</td>
+    <td>$([System.Net.WebUtility]::HtmlEncode($Impact))</td>
 </tr>
 "@
     }
@@ -279,8 +280,8 @@ function New-ErrorTableRow {
     try {
         return @"
 <tr>
-    <td>$([System.Web.HttpUtility]::HtmlEncode($FolderName))</td>
-    <td>$([System.Web.HttpUtility]::HtmlEncode($ErrorMessage))</td>
+    <td>$([System.Net.WebUtility]::HtmlEncode($FolderName))</td>
+    <td>$([System.Net.WebUtility]::HtmlEncode($ErrorMessage))</td>
     <td>High</td>
 </tr>
 "@
@@ -297,9 +298,9 @@ function New-PlanDetailsSection {
     )
     
     try {
-        $encodedPlan = [System.Web.HttpUtility]::HtmlEncode($PlanDetails)
+        $encodedPlan = [System.Net.WebUtility]::HtmlEncode($PlanDetails)
         return @"
-<h3>$([System.Web.HttpUtility]::HtmlEncode($FolderName)):</h3>
+<h3>$([System.Net.WebUtility]::HtmlEncode($FolderName)):</h3>
 <pre>$encodedPlan</pre>
 "@
     }
@@ -326,15 +327,22 @@ function Merge-ReportData {
         [string]$Template,
         [string]$AppName,
         [string]$SummaryRows,
-        [string]$PlanDetails
+        [string]$PlanDetails,
+        [switch]$Prod
     )
     
     try {
-        $report = $Template -replace "{{APPNAME}}", [System.Web.HttpUtility]::HtmlEncode($AppName)
+        $report = $Template -replace "{{APPNAME}}", [System.Net.WebUtility]::HtmlEncode($AppName)
         $report = $report -replace "{{GENERATED}}", (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
         $report = $report -replace "{{SUMMARY_ROWS}}", $SummaryRows
         $report = $report -replace "{{PLAN_DETAILS}}", $PlanDetails
-        
+
+        if ($Prod) {
+            # production case: uncomment the commented placeholders
+            $report = $report -replace "<!--{{SUMMARY_ROWS}}-->", $SummaryRows
+            $report = $report -replace "<!--{{PLAN_DETAILS}}-->", $PlanDetails
+        }
+
         return $report
     }
     catch {
@@ -350,6 +358,98 @@ function Save-Report {
     
     try {
         $Content | Out-File -FilePath $ReportPath -Encoding UTF8 -ErrorAction Stop
+    }
+    catch {
+        throw $_
+    }
+}
+
+function Archive-ExistingReport {
+    param(
+        [string]$ReportPath,
+        [string]$ReportOutputDir
+    )
+
+    try {
+        if (-not (Test-Path $ReportPath)) {
+            return
+        }
+
+        $archiveDir = Join-Path $ReportOutputDir "archive"
+        if (-not (Test-Path $archiveDir)) {
+            New-Item -ItemType Directory -Path $archiveDir -Force | Out-Null
+        }
+
+        $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+        $fileName = [System.IO.Path]::GetFileNameWithoutExtension($ReportPath)
+        $extension = [System.IO.Path]::GetExtension($ReportPath)
+        $archivedFileName = "$fileName-$timestamp$extension"
+        $archivedPath = Join-Path $archiveDir $archivedFileName
+
+        Move-Item -Path $ReportPath -Destination $archivedPath -Force
+    }
+    catch {
+        throw $_
+    }
+}
+
+function Update-DriftSummaryReport {
+    param(
+        [string]$ReportOutputDir,
+        [string]$SummaryTemplatePath
+    )
+
+    try {
+        if (-not (Test-Path $SummaryTemplatePath)) {
+            throw "Drift summary template not found: $SummaryTemplatePath"
+        }
+
+        if (-not (Test-Path $ReportOutputDir)) {
+            New-Item -ItemType Directory -Path $ReportOutputDir -Force | Out-Null
+        }
+
+        $summaryReportPath = Join-Path $ReportOutputDir "Drift-Summary-Report.html"
+        if (Test-Path $summaryReportPath) {
+            Archive-ExistingReport -ReportPath $summaryReportPath -ReportOutputDir $ReportOutputDir
+        }
+
+        Copy-Item -Path $SummaryTemplatePath -Destination $summaryReportPath -Force
+        $summaryContent = Get-Content -Path $summaryReportPath -Raw -ErrorAction Stop
+        $updatedOn = Get-Date -Format "yyyy-MM-dd"
+        $summaryContent = $summaryContent -replace '\{updatedon\}', $updatedOn
+
+        $reportFiles = Get-ChildItem -Path $ReportOutputDir -Filter 'Terraform-Drift-Report-*.html' -File -ErrorAction SilentlyContinue
+        $placeholderNames = [regex]::Matches($summaryContent, '\{([a-z0-9]+)\}', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase) |
+            ForEach-Object { $_.Groups[1].Value.ToLower() } |
+            Select-Object -Unique
+
+        foreach ($placeholder in $placeholderNames) {
+            $matchingFile = $reportFiles | Where-Object {
+                $_.BaseName -match ('^Terraform-Drift-Report-(?i)' + [regex]::Escape($placeholder) + '(?-i)(?:-prod|-preprod)?$')
+            } | Select-Object -First 1
+
+            if (-not $matchingFile) {
+                $matchingFile = $reportFiles | Where-Object {
+                    $_.BaseName -match ('^Terraform-Drift-Report-(?i)' + [regex]::Escape($placeholder) + '(?-i)')
+                } | Select-Object -First 1
+            }
+
+            $status = if ($matchingFile) { 'YES' } else { 'NO' }
+            $summaryContent = $summaryContent -replace [regex]::Escape("{$placeholder}"), $status
+
+            if ($matchingFile) {
+                $pattern = '(<tr.*?\{' + [regex]::Escape($placeholder) + '\}.*?href=")""'
+                $replacement = '$1' + $matchingFile.Name + '"'
+                $summaryContent = [System.Text.RegularExpressions.Regex]::Replace(
+                    $summaryContent,
+                    $pattern,
+                    $replacement,
+                    [System.Text.RegularExpressions.RegexOptions]::Singleline -bor [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+                )
+            }
+        }
+
+        Set-Content -Path $summaryReportPath -Value $summaryContent -Encoding UTF8 -Force
     }
     catch {
         throw $_
@@ -425,11 +525,18 @@ function Invoke-DriftAnalysis {
         }
         
         # Generate final report
-        $reportContent = Merge-ReportData -Template $template -AppName $appName -SummaryRows $summaryRows -PlanDetails $planDetails
+        $reportContent = Merge-ReportData -Template $template -AppName $appName -SummaryRows $summaryRows -PlanDetails $planDetails -Prod:$Prod
         
         # Save report
         $reportFile = Join-Path $ReportOutputDir "Terraform-Drift-Report-$appName-$modeName.html"
+
+        if (-not $Prod -and $Preprod -and (Test-Path $reportFile)) {
+            Archive-ExistingReport -ReportPath $reportFile -ReportOutputDir $ReportOutputDir
+        }
+
         Save-Report -ReportPath $reportFile -Content $reportContent
+
+        Update-DriftSummaryReport -ReportOutputDir $ReportOutputDir -SummaryTemplatePath $DriftSummaryTemplatePath
         
         Write-Host "Report generated: $reportFile"
         return $reportFile
