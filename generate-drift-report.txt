@@ -91,13 +91,6 @@ function Assert-MainBranch {
         else {
             Write-Host "Already on main branch" -ForegroundColor Green
         }
-
-        Write-Host "Pulling latest changes from origin/main..." -ForegroundColor Yellow
-        git pull origin main 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            throw "Failed to pull latest changes from origin/main"
-        }
-        Write-Host "Updated local main with remote changes" -ForegroundColor Green
         
         Pop-Location
     }
